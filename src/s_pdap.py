@@ -13,54 +13,22 @@ logging.basicConfig(
 
 
 class SPDAP_Finite:
-    # An implementation of the stochastic sampling approach to finite LGCG
+    # An implementation of the stochastic sampling approach to finite SPDAP
 
     def __init__(
         self,
         alpha: float,
-        data_path: str,
+        target: np.ndarray,
+        feature_generator: Callable,
         # test_power: float = 0.05,
         # parameter_increase: float = 0.1,
     ) -> None:
-        target = pd.read_csv(data_path)["log kappa_L"].to_numpy()
         self.target_norm = np.linalg.norm(target)
         self.target = target / self.target_norm
         self.alpha = alpha
+        self.feature_generator = feature_generator
         # self.test_power = test_power
         # self.parameter_increase = parameter_increase
-        self.ops = [
-            "add",
-            "sub",
-            "abs_diff",
-            "mult",
-            "div",
-            "inv",
-            "abs",
-            "exp",
-            "log",
-            "sin",
-            "cos",
-            "sq",
-            "cb",
-            "six_pow",
-            "sqrt",
-            "cbrt",
-            "neg_exp",
-        ]
-        self.feature_inputs = import_dataframe.create_inputs(
-            df=data_path,
-            max_rung=3,
-            max_param_depth=0,
-            prop_key="log kappa_L",
-            calc_type="regression",
-            n_sis_select=10,
-            allowed_ops=self.ops,
-            n_rung_generate=0,
-            n_rung_store=-1,
-            allowed_param_ops=[],
-            global_param_opt=False,
-            reparam_residual=False,
-        )
         self.g = get_default_g(self.alpha)
         self.L = 1
         self.j = lambda K, u: 0.5 * np.linalg.norm(
@@ -207,6 +175,8 @@ class SPDAP_Finite:
         while iterate > tolerance:
             size += 1
             iterate *= probability
+            if size > 1e6:
+                return 1e6
         return size
 
     def generate_sample_and_determine_incumbent(
@@ -215,7 +185,7 @@ class SPDAP_Finite:
         incumbent_dict = {}
 
         # Generate new sample
-        feature_space = FeatureSpace(self.feature_inputs)
+        feature_space = self.feature_generator()
         sample_features_raw = np.array([feature.value for feature in feature_space.phi])
         sample_norms = np.linalg.norm(sample_features_raw, axis=1)
         sample_features = np.array(
@@ -246,9 +216,7 @@ class SPDAP_Finite:
             incumbent_dict["feature"] = sample_features[incumbent]
             incumbent_dict["feature_norm"] = sample_norms[incumbent]
             incumbent_dict["expression"] = feature_space.phi[incumbent].expr
-            incumbent_dict["Phi_value"] = self.M * (
-                incumbent_dict["value"] - self.alpha
-            )
+            incumbent_dict["Phi_value"] = self.M * (max_value - self.alpha)
 
         return incumbent_dict, running_dict
 
@@ -267,7 +235,7 @@ class SPDAP_Finite:
                 "feature": running_dict["K_T"][incumbent],
                 "feature_norm": running_dict["norms"][incumbent],
                 "expression": running_dict["expressions"][incumbent],
-                "Phi_value": self.M * (incumbent_dict["value"] - self.alpha),
+                "Phi_value": self.M * (running_dict["values"][incumbent] - self.alpha),
             }
         else:
             incumbent_dict = {"value": -1}
@@ -283,17 +251,20 @@ class SPDAP_Finite:
             interval_probability, probability_tolerance
         )
         logging.info(f"Sample size for x_tilde: {sample_size}")
-
         while (
             len(running_dict["expressions"]) < sample_size
-            and incumbent_dict["value"] <= alternative_beta
+            and incumbent_dict["value"] <= self.alpha
         ):
-            incumbent_dict, running_dict = self.generate_sample_and_determine_incumbent(
-                running_dict, alternative_beta, rho
+            incumbent_dict_tentative, running_dict = (
+                self.generate_sample_and_determine_incumbent(
+                    running_dict, alternative_beta, rho
+                )
             )
             logging.info(
-                f"Generated sample so far: {len(running_dict['expressions']) }"
+                f"Generated sample so far: {len(running_dict['expressions'])} with best value {incumbent_dict['value']}"
             )
+            if len(incumbent_dict_tentative):
+                incumbent_dict = incumbent_dict_tentative
         return incumbent_dict, running_dict
 
     def find_x_k(
@@ -314,12 +285,16 @@ class SPDAP_Finite:
         )
         logging.info(f"Target sample size for x_k: {target_sample_size}")
         while len(running_dict["expressions"]) < target_sample_size:
-            incumbent_dict, running_dict = self.generate_sample_and_determine_incumbent(
-                running_dict, incumbent_dict["value"], rho
+            incumbent_dict_tentative, running_dict = (
+                self.generate_sample_and_determine_incumbent(
+                    running_dict, incumbent_dict["value"], rho
+                )
             )
             logging.info(
-                f"Generated sample so far: {len(running_dict['expressions']) }"
+                f"Generated sample so far: {len(running_dict['expressions'])} with best value {incumbent_dict['value']}"
             )
+            if len(incumbent_dict_tentative):
+                incumbent_dict = incumbent_dict_tentative
 
             # Compute new needed sample size
             P_incumbent = incumbent_dict["value"]  # P_k(x_k)
@@ -356,7 +331,7 @@ class SPDAP_Finite:
             x_tilde_dict, running_dict = self.find_x_tilde(
                 rho, tol, 1 - confidence, running_dict
             )
-            if x_tilde_dict["value"] < self.alpha / np.linalg.norm(rho):
+            if x_tilde_dict["value"] < self.alpha:
                 # optimality reached
                 break
 
@@ -364,9 +339,9 @@ class SPDAP_Finite:
             x_dict, running_dict = self.find_x_k(x_tilde_dict, rho, running_dict)
             eta_k = 8 / (k + 7)
             if x_dict["expression"] in active_dict["expressions"]:
-                index = np.where(active_dict["expressions"] == x_dict["expressions"])[
+                index = np.where(active_dict["expressions"] == x_dict["expression"])[0][
                     0
-                ][0]
+                ]
                 v = (
                     self.M
                     * np.sign(np.dot(rho, x_dict["feature"]))
@@ -408,7 +383,7 @@ class SPDAP_Finite:
 
             k += 1
             logging.info(
-                f"{k}: Phi_gap {x_dict['Phi_value']/self.M:.3E}, alternative_beta: {self.alpha / np.linalg.norm(rho)}, support {len(u)}"
+                f"{k}: Phi_gap {x_dict['Phi_value']/self.M:.3E}, alternative_beta: {self.alpha / np.linalg.norm(rho)}, support {active_dict['expressions']}"
             )
         logging.info(
             f"LGCG converged in {k} iterations to tolerance {tol:.3E} with confidence {confidence} and final sparsity of {len(u)}"
@@ -422,5 +397,40 @@ class SPDAP_Finite:
 
 
 if __name__ == "__main__":
-    exp = SPDAP_Finite(0.1, "data/thermal_conductivity_data.csv")
+    ops = [
+        "add",
+        "sub",
+        "abs_diff",
+        "mult",
+        "div",
+        "inv",
+        "abs",
+        "exp",
+        "log",
+        "sin",
+        "cos",
+        "sq",
+        "cb",
+        "six_pow",
+        "sqrt",
+        "cbrt",
+        "neg_exp",
+    ]
+    feature_inputs = import_dataframe.create_inputs(
+        df="data/thermal_conductivity_data.csv",
+        max_rung=3,
+        max_param_depth=0,
+        prop_key="log kappa_L",
+        calc_type="regression",
+        n_sis_select=10,
+        allowed_ops=ops,
+        n_rung_generate=0,
+        n_rung_store=-1,
+        allowed_param_ops=[],
+        global_param_opt=False,
+        reparam_residual=False,
+    )
+    feature_generator = lambda: FeatureSpace(feature_inputs)
+    target = pd.read_csv("data/thermal_conductivity_data.csv")["log kappa_L"].to_numpy()
+    exp = SPDAP_Finite(0.1, target, feature_generator)
     exp.solve_exact(tol=0.001, confidence=0.999)
